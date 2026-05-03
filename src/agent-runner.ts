@@ -358,7 +358,44 @@ export async function runAgent(
   }
 
   try {
-    await session.prompt(effectivePrompt);
+    if (options.signal?.aborted) {
+      // Already aborted before we started — skip prompt entirely
+      aborted = true;
+    } else {
+      // Race session.prompt() against the abort signal so that runAgent
+      // returns promptly when the parent aborts, even if session.abort()
+      // (called via forwardAbortSignal) takes time to propagate through
+      // the agent loop. Without this race, session.prompt() may hang
+      // indefinitely because forwardAbortSignal fires session.abort()
+      // without awaiting it, and the agent loop only stops when its
+      // current LLM stream or tool execution notices the signal.
+      const promptPromise = session.prompt(effectivePrompt);
+      if (options.signal) {
+        let cleanupAbortRace: (() => void) | undefined;
+        const abortPromise = new Promise<never>((_resolve, reject) => {
+          const onAbort = () => reject(new Error("Subagent was aborted"));
+          if (options.signal!.aborted) { onAbort(); return; }
+          options.signal!.addEventListener("abort", onAbort, { once: true });
+          cleanupAbortRace = () => options.signal!.removeEventListener("abort", onAbort);
+        });
+        try {
+          await Promise.race([promptPromise, abortPromise]);
+        } finally {
+          cleanupAbortRace?.();
+        }
+      } else {
+        await promptPromise;
+      }
+    }
+  } catch (err: any) {
+    // If the abort signal fired, mark as aborted but don't propagate the error.
+    // The AgentManager already set record.status = "stopped" synchronously,
+    // so the caller (spawnAndWait → .then/.catch) will see the correct status.
+    if (options.signal?.aborted) {
+      aborted = true;
+    } else {
+      throw err;
+    }
   } finally {
     unsubTurns();
     collector.unsubscribe();
@@ -388,7 +425,29 @@ export async function resumeAgent(
     : () => {};
 
   try {
-    await session.prompt(prompt);
+    if (options.signal?.aborted) {
+      // Already aborted — skip resume
+    } else {
+      const promptPromise = session.prompt(prompt);
+      if (options.signal) {
+        let cleanupAbortRace: (() => void) | undefined;
+        const abortPromise = new Promise<never>((_resolve, reject) => {
+          const onAbort = () => reject(new Error("Subagent was aborted"));
+          if (options.signal!.aborted) { onAbort(); return; }
+          options.signal!.addEventListener("abort", onAbort, { once: true });
+          cleanupAbortRace = () => options.signal!.removeEventListener("abort", onAbort);
+        });
+        try {
+          await Promise.race([promptPromise, abortPromise]);
+        } finally {
+          cleanupAbortRace?.();
+        }
+      } else {
+        await promptPromise;
+      }
+    }
+  } catch (err: any) {
+    if (!options.signal?.aborted) throw err;
   } finally {
     collector.unsubscribe();
     unsubToolUse();
